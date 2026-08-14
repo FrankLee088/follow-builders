@@ -29,8 +29,28 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
+    # 续期那一步要往 main 推空提交，所以需要写权限。
+    permissions:
+      contents: write
+
     steps:
       - uses: actions/checkout@v4
+
+      # 公开仓库里，只靠 cron 触发的 workflow 在 60 天没有仓库活动之后会被 GitHub
+      # 自动停用，而定时运行本身不算活动。所以快到期时推一个空提交续期。放在最前面
+      # 是为了让它不受后面步骤成败的影响 —— 连续失败 60 天同样会让 schedule 失效。
+      - name: Keep the schedule alive
+        if: github.event_name == 'schedule'
+        run: |
+          days=$(( ( $(date +%s) - $(git log -1 --format=%ct HEAD) ) / 86400 ))
+          echo "距上次提交 ${days} 天"
+          if [ "$days" -lt 45 ]; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit --allow-empty -m 'chore: 保持定时任务有效'
+          git push origin HEAD:${{ github.event.repository.default_branch }}
 
       # 不开 npm cache：cache 只是加快速度，但 lockfile 一有问题整个 job 就挂。
       - uses: actions/setup-node@v4
