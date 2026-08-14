@@ -1,0 +1,124 @@
+name: Feishu Digest
+
+# 每天把 AI builders 简报推到飞书。
+#
+# 三步：prepare-digest.js 抓取素材 → remix-api.js 用 Claude 生成中文简报
+# → feishu-deliver.js 发成飞书卡片。
+#
+# 需要两个 repo secret（Settings → Secrets and variables → Actions）：
+#   ANTHROPIC_API_KEY   — LLM API key
+#   FEISHU_WEBHOOK_URL  — 飞书群自定义机器人 webhook
+#
+# 中国大陆不在 Anthropic 支持的计费地区内，Console 里没有对应选项。所以这里
+# 支持换用其它兼容 Anthropic Messages 格式的服务商，配两个 repo variable
+# （Settings → Secrets and variables → Actions → Variables，不是 Secrets）：
+#   FB_ANTHROPIC_BASE_URL — 例如 https://api.deepseek.com/anthropic
+#   FB_MODEL              — 例如 deepseek-v4-pro
+# 两个都留空就走 Anthropic 官方 + claude-opus-5。
+
+on:
+  schedule:
+    # 北京时间每天 08:07（UTC 00:07）。避开 :00 和 :30 分钟以分散 API 负载。
+    # 上游 generate-feed.yml 在 UTC 06:17 刷新素材，所以这里取到的是前一天的
+    # 那批 feed，内容完整。
+    - cron: '7 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 不开 npm cache：cache 只是加快速度，但 lockfile 一有问题整个 job 就挂。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check secrets
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        run: |
+          # 只打印长度和是否有多余空白，绝不打印内容本身。
+          fail=0
+          for name in ANTHROPIC_API_KEY FEISHU_WEBHOOK_URL; do
+            value="${!name}"
+            if [ -z "$value" ]; then
+              echo "::error::$name is not set — 在 repo Settings → Secrets 里添加"
+              fail=1
+              continue
+            fi
+            trimmed="$(printf '%s' "$value" | tr -d '[:space:]')"
+            if [ "${#trimmed}" -ne "${#value}" ]; then
+              echo "::warning::$name 含有空白字符（长度 ${#value}，去掉空白后 ${#trimmed}）——粘贴时可能多带了换行"
+            fi
+            echo "$name: ok (length ${#value})"
+          done
+          exit $fail
+
+      - name: Install dependencies
+        run: cd scripts && npm ci
+
+      # prepare-digest.js 任何一个 feed 抓取失败就整体退出，偶发网络抖动会白白
+      # 损失一天的简报，所以退避重试三次。
+      - name: Prepare digest feed
+        run: |
+          cd scripts
+          for attempt in 1 2 3; do
+            if node prepare-digest.js > feed.json && [ -s feed.json ]; then
+              echo "prepare ok on attempt $attempt"
+              exit 0
+            fi
+            echo "prepare-digest.js attempt $attempt failed"
+            [ "$attempt" -lt 3 ] && sleep $((attempt * 20))
+          done
+          echo "::error::prepare-digest.js failed after 3 attempts"
+          exit 1
+
+      - name: Remix into Chinese digest
+        id: remix
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          FB_TIMEZONE: Asia/Shanghai
+          # 空值时 remix-api.js 用自己的默认值（Anthropic 官方 + claude-opus-5）。
+          FB_ANTHROPIC_BASE_URL: ${{ vars.FB_ANTHROPIC_BASE_URL }}
+          FB_MODEL: ${{ vars.FB_MODEL }}
+        run: |
+          cd scripts
+          set +e
+          node remix-api.js --file feed.json > digest.md
+          rc=$?
+          set -e
+          if [ "$rc" = "2" ]; then
+            # 今天追踪的 builder 没有新内容，不发空简报。
+            echo "no-content=true" >> "$GITHUB_OUTPUT"
+            echo "feed 里没有内容，跳过推送"
+            exit 0
+          fi
+          if [ "$rc" != "0" ]; then
+            echo "::error::remix-api.js exited $rc"
+            exit "$rc"
+          fi
+          echo "digest: $(wc -c < digest.md) bytes"
+
+      - name: Deliver to Feishu
+        if: steps.remix.outputs.no-content != 'true'
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
+        run: cd scripts && node feishu-deliver.js --file digest.md
+
+      # 推送失败时把生成好的简报留下来，免得重跑一次又要付一次 API 费用。
+      - name: Upload digest on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ github.run_id }}
+          path: |
+            scripts/digest.md
+            scripts/feed.json
+          retention-days: 7
+          if-no-files-found: ignore

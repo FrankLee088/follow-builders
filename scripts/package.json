@@ -5,9 +5,12 @@
   "type": "module",
   "scripts": {
     "generate-feed": "node generate-feed.js",
-    "prepare-digest": "node prepare-digest.js"
+    "prepare-digest": "node prepare-digest.js",
+    "remix": "node remix-api.js",
+    "deliver-feishu": "node feishu-deliver.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "0.116.0",
     "dotenv": "^16.4.0",
     "proper-lockfile": "^4.1.0"
   }
