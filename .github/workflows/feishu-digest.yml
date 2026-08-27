@@ -108,28 +108,45 @@ jobs:
           FB_MODEL: ${{ vars.FB_MODEL }}
         run: |
           cd scripts
-          set +e
-          node remix-api.js --file feed.json > digest.md
-          rc=$?
-          set -e
-          if [ "$rc" = "2" ]; then
-            # 今天追踪的 builder 没有新内容，不发空简报。
-            echo "no-content=true" >> "$GITHUB_OUTPUT"
-            echo "feed 里没有内容，跳过推送"
-            exit 0
-          fi
-          if [ "$rc" != "0" ]; then
-            echo "::error::remix-api.js exited $rc"
-            exit "$rc"
-          fi
-          echo "digest: $(wc -c < digest.md) bytes"
+          # 限流、502、连接中断都是一次性故障，重试就能过。退避拉长一些，因为
+          # 限流窗口通常是分钟级的。退出码 2 表示今天没内容，不该重试。
+          for attempt in 1 2 3; do
+            set +e
+            node remix-api.js --file feed.json > digest.md
+            rc=$?
+            set -e
+            if [ "$rc" = "0" ] && [ -s digest.md ]; then
+              echo "remix ok on attempt $attempt — digest: $(wc -c < digest.md) bytes"
+              exit 0
+            fi
+            if [ "$rc" = "2" ]; then
+              # 今天追踪的 builder 没有新内容，不发空简报。
+              echo "no-content=true" >> "$GITHUB_OUTPUT"
+              echo "feed 里没有内容，跳过推送"
+              exit 0
+            fi
+            echo "::warning::remix-api.js attempt $attempt exited $rc"
+            [ "$attempt" -lt 3 ] && sleep $((attempt * 45))
+          done
+          echo "::error::remix-api.js failed after 3 attempts"
+          exit 1
 
       - name: Deliver to Feishu
         if: steps.remix.outputs.no-content != 'true'
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
-        run: cd scripts && node feishu-deliver.js --file digest.md
+        run: |
+          cd scripts
+          for attempt in 1 2 3; do
+            if node feishu-deliver.js --file digest.md; then
+              exit 0
+            fi
+            echo "::warning::feishu-deliver.js attempt $attempt failed"
+            [ "$attempt" -lt 3 ] && sleep $((attempt * 15))
+          done
+          echo "::error::feishu-deliver.js failed after 3 attempts"
+          exit 1
 
       # 推送失败时把生成好的简报留下来，免得重跑一次又要付一次 API 费用。
       - name: Upload digest on failure
